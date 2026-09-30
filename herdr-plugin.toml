@@ -1,6 +1,6 @@
 id = "quinnjr.herdr-notifications"
 name = "herdr-notifications"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.7.0" # 0.7 bare event JSON + 0.8 {event,data} envelope both supported
 description = "Relays herdr agent-status changes (blocked/done) to native OS desktop notifications on Linux, macOS, and Windows (also builds and runs on BSD)."
 # herdr's plugin platform enum only knows linux/macos/windows; the underlying
