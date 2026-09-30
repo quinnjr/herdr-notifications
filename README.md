@@ -57,12 +57,9 @@ plugin's binary is invoked once per event:
 3. The notification is shown on a background thread with a bounded wait, so
    a stuck notification daemon can never hang the process indefinitely.
    Summary is `{agent} is done` / `{agent} needs you`; body is
-   `location · tab` plus a short `Click to open` hint, taken from
-   `HERDR_PLUGIN_CONTEXT_JSON` when it describes the pane that changed.
-   Otherwise it falls back to `herdr pane list`, where the first label is
-   the pane's cwd basename (or its workspace id) and the second is its tab
-   id — close enough to place the pane, but not the workspace and tab
-   *labels* the context path gives you.
+   `location · tab` plus a short `Click to open` hint. Labels come from
+   `herdr pane` / `workspace` / `tab` list for the event pane, falling back
+   to `HERDR_PLUGIN_CONTEXT_JSON`, then cwd basename / tab id.
 4. Actionable toasts show a single **Close** button where the platform
    supports notification actions (Linux/BSD, Windows, macOS). Clicking the
    notification body runs `herdr agent focus <pane_id>` to bring that pane

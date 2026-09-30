@@ -129,6 +129,8 @@ struct PluginContext {
     #[serde(default)]
     workspace_id: String,
     #[serde(default)]
+    tab_id: String,
+    #[serde(default)]
     tab_label: String,
     #[serde(default)]
     focused_pane_id: String,
@@ -175,13 +177,6 @@ fn format_notification_body(primary: &str, secondary: &str, title: &str, agent: 
     }
 }
 
-/// Resolve the two display labels for `pane_id`, as `(primary, secondary)`.
-///
-/// Deliberately *not* named workspace/tab: only the `HERDR_PLUGIN_CONTEXT_JSON`
-/// path yields a genuine workspace label and tab label. The `herdr pane list`
-/// fallback substitutes the pane's cwd basename and tab id, which read better
-/// in a toast (`herdr-notifications` beats `w1`) but are not workspace labels.
-
 /// Append the short body-click hint for actionable status notifications.
 fn append_click_hint(body: &str) -> String {
     if body.is_empty() {
@@ -191,10 +186,17 @@ fn append_click_hint(body: &str) -> String {
     }
 }
 
+/// Resolve the two display labels for `pane_id`, as `(primary, secondary)`.
+///
+/// Always keyed to the pane that fired the event: `herdr pane list` plus
+/// workspace/tab list lookups first, then `HERDR_PLUGIN_CONTEXT_JSON` when
+/// the CLI path fails.
 fn resolve_location_labels(pane_id: &str, workspace_id: &str) -> (String, String) {
+    if let Some(labels) = lookup_pane_labels(pane_id) {
+        return labels;
+    }
     if let Ok(raw) = env::var("HERDR_PLUGIN_CONTEXT_JSON") {
         if let Ok(ctx) = serde_json::from_str::<PluginContext>(&raw) {
-            // Event hooks usually set context to the pane that changed.
             if ctx.focused_pane_id.is_empty() || ctx.focused_pane_id == pane_id {
                 let primary = if !ctx.workspace_label.is_empty() {
                     ctx.workspace_label
@@ -203,51 +205,133 @@ fn resolve_location_labels(pane_id: &str, workspace_id: &str) -> (String, String
                 } else {
                     workspace_id.to_string()
                 };
-                return (primary, ctx.tab_label);
+                let secondary = if !ctx.tab_label.is_empty() {
+                    ctx.tab_label
+                } else {
+                    lookup_tab_label(&ctx.tab_id).unwrap_or_default()
+                };
+                return (primary, secondary);
             }
         }
-    }
-    if let Some(labels) = lookup_pane_labels(pane_id) {
-        return labels;
     }
     (workspace_id.to_string(), String::new())
 }
 
-/// `(cwd basename or workspace id, tab id)` for `pane_id` from `herdr pane list`.
-/// See [`resolve_location_labels`] for why these are labels, not a workspace/tab pair.
-fn lookup_pane_labels(pane_id: &str) -> Option<(String, String)> {
-    let bin = env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string());
-    let output = Command::new(&bin).args(["pane", "list"]).output().ok()?;
-    if !output.status.success() {
+#[derive(Debug, Deserialize)]
+struct PaneRow {
+    pane_id: String,
+    #[serde(default)]
+    cwd: String,
+    #[serde(default)]
+    tab_id: String,
+    #[serde(default)]
+    workspace_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PaneListEnvelope {
+    result: PaneListResult,
+}
+
+#[derive(Debug, Deserialize)]
+struct PaneListResult {
+    panes: Vec<PaneRow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TabRow {
+    tab_id: String,
+    #[serde(default)]
+    label: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TabListEnvelope {
+    result: TabListResult,
+}
+
+#[derive(Debug, Deserialize)]
+struct TabListResult {
+    tabs: Vec<TabRow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceRow {
+    workspace_id: String,
+    #[serde(default)]
+    label: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceListEnvelope {
+    result: WorkspaceListResult,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceListResult {
+    workspaces: Vec<WorkspaceRow>,
+}
+
+fn herdr_bin() -> String {
+    env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string())
+}
+
+fn run_herdr(args: &[&str]) -> Option<Vec<u8>> {
+    let output = Command::new(&herdr_bin()).args(args).output().ok()?;
+    output.status.success().then_some(output.stdout)
+}
+
+/// Herdr tab label for `tab_id`, from `herdr tab list`.
+fn lookup_tab_label(tab_id: &str) -> Option<String> {
+    if tab_id.is_empty() {
         return None;
     }
-    #[derive(Deserialize)]
-    struct PaneListEnvelope {
-        result: PaneListResult,
+    let stdout = run_herdr(&["tab", "list"])?;
+    let envelope: TabListEnvelope = serde_json::from_slice(&stdout).ok()?;
+    envelope
+        .result
+        .tabs
+        .into_iter()
+        .find(|t| t.tab_id == tab_id)
+        .map(|t| t.label)
+        .filter(|label| !label.is_empty())
+}
+
+/// Herdr workspace label for `workspace_id`, from `herdr workspace list`.
+fn lookup_workspace_label(workspace_id: &str) -> Option<String> {
+    if workspace_id.is_empty() {
+        return None;
     }
-    #[derive(Deserialize)]
-    struct PaneListResult {
-        panes: Vec<PaneRow>,
-    }
-    #[derive(Deserialize)]
-    struct PaneRow {
-        pane_id: String,
-        #[serde(default)]
-        cwd: String,
-        #[serde(default)]
-        tab_id: String,
-        #[serde(default)]
-        workspace_id: String,
-    }
-    let envelope: PaneListEnvelope = serde_json::from_slice(&output.stdout).ok()?;
-    let row = envelope.result.panes.into_iter().find(|p| p.pane_id == pane_id)?;
-    let primary = Path::new(&row.cwd)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or(row.workspace_id);
-    Some((primary, row.tab_id))
+    let stdout = run_herdr(&["workspace", "list"])?;
+    let envelope: WorkspaceListEnvelope = serde_json::from_slice(&stdout).ok()?;
+    envelope
+        .result
+        .workspaces
+        .into_iter()
+        .find(|w| w.workspace_id == workspace_id)
+        .map(|w| w.label)
+        .filter(|label| !label.is_empty())
+}
+
+/// `(workspace label, tab label)` for `pane_id` via `herdr pane list` plus tab/workspace list fallbacks.
+fn lookup_pane_labels(pane_id: &str) -> Option<(String, String)> {
+    let stdout = run_herdr(&["pane", "list"])?;
+    let envelope: PaneListEnvelope = serde_json::from_slice(&stdout).ok()?;
+    let row = envelope
+        .result
+        .panes
+        .into_iter()
+        .find(|p| p.pane_id == pane_id)?;
+    let primary = lookup_workspace_label(&row.workspace_id).unwrap_or_else(|| {
+        Path::new(&row.cwd)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| row.workspace_id.clone())
+    });
+    let secondary = lookup_tab_label(&row.tab_id).unwrap_or(row.tab_id);
+    Some((primary, secondary))
 }
 
 fn main() -> ExitCode {
@@ -725,7 +809,7 @@ fn normalize_action_response(response: &ActionResponse<'_>) -> NotificationRespo
 /// hands every plugin process via $HERDR_BIN_PATH (falling back to `herdr`
 /// on PATH) rather than talking to the socket API directly.
 fn focus_pane(pane_id: &str) {
-    let bin = env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string());
+    let bin = herdr_bin();
     match Command::new(&bin).args(["agent", "focus", pane_id]).output() {
         Ok(output) if !output.status.success() => {
             eprintln!(
