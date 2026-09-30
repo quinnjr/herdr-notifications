@@ -19,7 +19,7 @@ use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(all(unix, not(target_os = "macos")))]
 use notify_rust::ActionResponse;
@@ -824,6 +824,13 @@ fn focus_pane(pane_id: &str) {
     }
 }
 
+/// Suppress toasts for this many seconds after `herdr server` starts.
+/// Covers laptop-boot restore storms where agents briefly look `working`
+/// then settle on `blocked`/`done`. Override with
+/// `HERDR_NOTIFICATIONS_STARTUP_QUIET_SECS` (`0` disables).
+const STARTUP_QUIET_SECS: u64 = 90;
+const STARTUP_QUIET_ENV: &str = "HERDR_NOTIFICATIONS_STARTUP_QUIET_SECS";
+
 /// Dedupe notifications: only fire when this pane's status actually changed
 /// since the last time we saw it. State lives under $HERDR_PLUGIN_STATE_DIR
 /// (falling back to a per-user local-data directory) so it survives across
@@ -832,12 +839,228 @@ fn should_notify(pane_id: &str, agent_status: &str) -> bool {
     let path = state_file_path();
     with_state_lock(&path, || {
         let mut state = load_state(&path);
-        let changed = record_status_if_changed(&mut state, pane_id, agent_status);
-        if changed {
+        let previous = state.get(pane_id).cloned();
+        let update = record_status_for_notify(&mut state, pane_id, agent_status);
+        if update.changed {
             save_state(&path, &state);
         }
-        changed
+        let quiet_secs = startup_quiet_secs();
+        let server_age_secs = herdr_server_age_secs();
+        let notify = final_notify(update.notify, server_age_secs, quiet_secs);
+        transition_debug_log(&format_transition_log_line(
+            pane_id,
+            previous.as_deref(),
+            agent_status,
+            update.changed,
+            update.notify,
+            server_age_secs,
+            quiet_secs,
+            notify,
+        ));
+        notify
     })
+}
+
+/// Parsed quiet-window length. `0` disables suppression.
+fn startup_quiet_secs() -> u64 {
+    match env::var(STARTUP_QUIET_ENV) {
+        Ok(raw) => match raw.parse::<u64>() {
+            Ok(secs) => secs,
+            Err(_) => {
+                eprintln!(
+                    "herdr-notifications: invalid {STARTUP_QUIET_ENV}={raw:?}, using {STARTUP_QUIET_SECS}"
+                );
+                STARTUP_QUIET_SECS
+            }
+        },
+        Err(_) => STARTUP_QUIET_SECS,
+    }
+}
+
+/// Apply the startup quiet window on top of a transition-level notify decision.
+fn final_notify(transition_notify: bool, server_age_secs: Option<u64>, quiet_secs: u64) -> bool {
+    if !transition_notify {
+        return false;
+    }
+    if quiet_secs == 0 {
+        return true;
+    }
+    match server_age_secs {
+        Some(age) if age < quiet_secs => false,
+        _ => true,
+    }
+}
+
+/// One-line transition decision for `transition-debug.log`.
+fn format_transition_log_line(
+    pane_id: &str,
+    previous: Option<&str>,
+    agent_status: &str,
+    changed: bool,
+    transition_notify: bool,
+    server_age_secs: Option<u64>,
+    quiet_secs: u64,
+    notify: bool,
+) -> String {
+    let prev = previous.unwrap_or("-");
+    let age = match server_age_secs {
+        Some(secs) => secs.to_string(),
+        None => "unknown".to_string(),
+    };
+    format!(
+        "pane={pane_id} {prev}->{agent_status} changed={changed} transition_notify={transition_notify} server_age_secs={age} quiet_secs={quiet_secs} => notify={notify}"
+    )
+}
+
+/// Append transition decisions under the plugin state dir (survives short-lived
+/// event processes; useful for diagnosing boot-time toast floods).
+fn transition_debug_log(message: &str) {
+    let path = state_file_path().with_file_name("transition-debug.log");
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!("{now} {message}\n");
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write;
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// Best-effort age of the running `herdr server`, used for the startup quiet
+/// window. Prefers the API socket mtime (recreated on server start), then a
+/// `/proc` walk for a parent `herdr` process on Linux.
+fn herdr_server_age_secs() -> Option<u64> {
+    if let Some(age) = file_age_secs(&herdr_api_socket_path()) {
+        return Some(age);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return linux_herdr_ancestor_age_secs();
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+fn herdr_api_socket_path() -> PathBuf {
+    if let Ok(path) = env::var("HERDR_API_SOCKET") {
+        return PathBuf::from(path);
+    }
+    if let Some(dir) = env::var_os("XDG_CONFIG_HOME") {
+        return PathBuf::from(dir).join("herdr").join("herdr.sock");
+    }
+    if let Some(home) = env::var_os("HOME") {
+        return PathBuf::from(home).join(".config/herdr/herdr.sock");
+    }
+    PathBuf::from("herdr.sock")
+}
+
+fn file_age_secs(path: &Path) -> Option<u64> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    SystemTime::now().duration_since(modified).ok().map(|d| d.as_secs())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_herdr_ancestor_age_secs() -> Option<u64> {
+    let mut pid = std::process::id();
+    for _ in 0..32 {
+        let ppid = linux_ppid(pid)?;
+        if ppid == 0 || ppid == pid {
+            return None;
+        }
+        let comm = fs::read_to_string(format!("/proc/{ppid}/comm")).ok()?;
+        if comm.trim() == "herdr" {
+            return linux_process_age_secs(ppid);
+        }
+        pid = ppid;
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_ppid(pid: u32) -> Option<u32> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("PPid:") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_age_secs(pid: u32) -> Option<u64> {
+    // /proc/<pid>/stat field 22 (1-based) is starttime in clock ticks since boot.
+    // Linux USER_HZ is 100 on every arch we care about; avoid a libc dep.
+    const LINUX_CLK_TCK: f64 = 100.0;
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let close = stat.rfind(')')?;
+    let after = stat.get(close + 2..)?;
+    let start_ticks: u64 = after.split_whitespace().nth(19)?.parse().ok()?;
+    let uptime_secs = fs::read_to_string("/proc/uptime")
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse::<f64>()
+        .ok()?;
+    let start_secs = start_ticks as f64 / LINUX_CLK_TCK;
+    let age = (uptime_secs - start_secs).max(0.0).floor() as u64;
+    Some(age)
+}
+
+/// Result of recording a status into the dedup table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StatusUpdate {
+    /// The on-disk entry changed (including first-sight seeds).
+    changed: bool,
+    /// Whether this transition should surface a notification.
+    notify: bool,
+}
+
+/// Pure dedup-table update: records `agent_status` for `pane_id`.
+///
+/// First sight seeds silently (no notify). Later transitions notify only when
+/// they look like real work stopping — `working → blocked` / `working → done`,
+/// plus `blocked → done` — so server restore churn through `idle`/`unknown`
+/// does not toast every restored agent.
+fn record_status_for_notify(
+    state: &mut HashMap<String, String>,
+    pane_id: &str,
+    agent_status: &str,
+) -> StatusUpdate {
+    let Some(previous) = state.get(pane_id).map(String::as_str) else {
+        state.insert(pane_id.to_string(), agent_status.to_string());
+        return StatusUpdate {
+            changed: true,
+            notify: false,
+        };
+    };
+    if previous == agent_status {
+        return StatusUpdate {
+            changed: false,
+            notify: false,
+        };
+    }
+    let notify = should_notify_transition(previous, agent_status);
+    state.insert(pane_id.to_string(), agent_status.to_string());
+    StatusUpdate {
+        changed: true,
+        notify,
+    }
+}
+
+/// Whether a recorded status transition is worth a toast.
+fn should_notify_transition(previous: &str, agent_status: &str) -> bool {
+    match agent_status {
+        "blocked" => previous == "working",
+        "done" => matches!(previous, "working" | "blocked"),
+        _ => false,
+    }
 }
 
 /// Pure dedup-table update: records `agent_status` for `pane_id`, returning
@@ -1024,6 +1247,116 @@ mod tests {
     fn record_status_first_seen_changes() {
         let mut state = HashMap::new();
         assert!(record_status_if_changed(&mut state, "p1", "blocked"));
+    }
+
+    #[test]
+    fn record_status_for_notify_seeds_first_sight_without_notify() {
+        let mut state = HashMap::new();
+        assert_eq!(
+            record_status_for_notify(&mut state, "p1", "blocked"),
+            StatusUpdate {
+                changed: true,
+                notify: false,
+            }
+        );
+        assert_eq!(state.get("p1").map(String::as_str), Some("blocked"));
+    }
+
+    #[test]
+    fn record_status_for_notify_same_status_after_seed_does_not_notify() {
+        let mut state = HashMap::new();
+        assert!(!record_status_for_notify(&mut state, "p1", "blocked").notify);
+        assert_eq!(
+            record_status_for_notify(&mut state, "p1", "blocked"),
+            StatusUpdate {
+                changed: false,
+                notify: false,
+            }
+        );
+    }
+
+    #[test]
+    fn record_status_for_notify_working_to_blocked_or_done_notifies() {
+        let mut state = HashMap::new();
+        assert!(!record_status_for_notify(&mut state, "p1", "working").notify);
+        assert!(record_status_for_notify(&mut state, "p1", "blocked").notify);
+        assert!(!record_status_for_notify(&mut state, "p1", "working").notify);
+        assert!(record_status_for_notify(&mut state, "p1", "done").notify);
+    }
+
+    #[test]
+    fn record_status_for_notify_blocked_to_done_notifies() {
+        let mut state = HashMap::new();
+        state.insert("p1".into(), "blocked".into());
+        assert!(record_status_for_notify(&mut state, "p1", "done").notify);
+    }
+
+    #[test]
+    fn record_status_for_notify_restore_churn_does_not_notify() {
+        // Laptop reboot: herdr walks idle/unknown before settling on done/blocked.
+        let mut state = HashMap::new();
+        state.insert("p1".into(), "done".into());
+        assert!(!record_status_for_notify(&mut state, "p1", "unknown").notify);
+        assert!(!record_status_for_notify(&mut state, "p1", "done").notify);
+        assert!(!record_status_for_notify(&mut state, "p1", "idle").notify);
+        assert!(!record_status_for_notify(&mut state, "p1", "blocked").notify);
+    }
+
+    #[test]
+    fn record_status_for_notify_working_cycle_notifies_again() {
+        let mut state = HashMap::new();
+        assert!(!record_status_for_notify(&mut state, "p1", "working").notify);
+        assert!(record_status_for_notify(&mut state, "p1", "blocked").notify);
+        assert!(!record_status_for_notify(&mut state, "p1", "working").notify);
+        assert!(record_status_for_notify(&mut state, "p1", "blocked").notify);
+    }
+
+    #[test]
+    fn should_notify_transition_matches_live_work_stopping() {
+        assert!(should_notify_transition("working", "blocked"));
+        assert!(should_notify_transition("working", "done"));
+        assert!(should_notify_transition("blocked", "done"));
+        assert!(!should_notify_transition("idle", "blocked"));
+        assert!(!should_notify_transition("unknown", "done"));
+        assert!(!should_notify_transition("done", "blocked"));
+        assert!(!should_notify_transition("working", "idle"));
+    }
+
+    #[test]
+    fn final_notify_suppresses_during_startup_quiet_window() {
+        // Restore storm right after herdr server start: transition looks
+        // notify-worthy, but server is still within the quiet window.
+        assert!(!final_notify(true, Some(5), 90));
+        assert!(!final_notify(true, Some(89), 90));
+        assert!(final_notify(true, Some(90), 90));
+        assert!(final_notify(true, Some(120), 90));
+    }
+
+    #[test]
+    fn final_notify_respects_disabled_quiet_and_non_notify() {
+        assert!(!final_notify(false, Some(5), 90));
+        assert!(final_notify(true, Some(5), 0)); // quiet disabled
+        assert!(final_notify(true, None, 90)); // unknown age: do not brick
+    }
+
+    #[test]
+    fn format_transition_log_line_includes_decision_fields() {
+        let line = format_transition_log_line(
+            "w1:p9",
+            Some("working"),
+            "blocked",
+            true,
+            true,
+            Some(12),
+            90,
+            false,
+        );
+        assert!(line.contains("pane=w1:p9"));
+        assert!(line.contains("working->blocked"));
+        assert!(line.contains("transition_notify=true"));
+        assert!(line.contains("server_age_secs=12"));
+        assert!(line.contains("quiet_secs=90"));
+        assert!(line.contains("=> notify=false"));
     }
 
     #[test]

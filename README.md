@@ -8,10 +8,12 @@ terminal.
 - **Cross-platform**: Linux, macOS, and Windows via [`notify-rust`](https://github.com/hoodie/notify-rust)
   (also builds and runs on the BSDs, though herdr's own plugin manifest
   schema doesn't have a platform value for them yet).
-- **Only notifies when it matters**: fires on `blocked` (agent needs input)
-  and `done` (agent finished), and dedupes so an unchanged status never
-  re-notifies — but a `blocked → working → blocked` cycle correctly notifies
-  again, since it's not a repeat.
+- **Only notifies when it matters**: toasts on `working → blocked` (needs
+  input), `working → done` / `blocked → done` (finished). Unchanged status
+  never re-notifies; a `blocked → working → blocked` cycle still pings again.
+  First sight of a pane seeds silently, and restore churn through
+  `idle`/`unknown` does not toast — so restarting `herdr server` after a
+  laptop reboot no longer floods notifications for every restored agent.
 - **Click to focus**: clicking a status-change notification focuses the
   originating pane back in herdr.
 - **Location in the toast**: body shows `workspace · tab` (and the agent
@@ -50,22 +52,33 @@ plugin's binary is invoked once per event:
 1. Every status transition is recorded to a small on-disk dedup table (one
    entry per pane), written atomically (temp file + rename) and guarded by
    a short-lived exclusive lock, so concurrent status changes across
-   multiple panes can't corrupt or race on it.
-2. Only `blocked` and `done` are surfaced as notifications — `idle` /
-   `working` / `unknown` are recorded (so the next `blocked`/`done` is
-   correctly recognized as new) but never notify on their own.
-3. The notification is shown on a background thread with a bounded wait, so
+   multiple panes can't corrupt or race on it. The first time a pane is seen
+   the entry is seeded without notifying.
+2. A toast fires only when live work stops: `working → blocked`,
+   `working → done`, or `blocked → done`. Transitions through `idle` /
+   `unknown` (common when `herdr server` respawns panes on laptop boot)
+   update the table but do not notify.
+3. For ~90 seconds after `herdr server` starts (API socket age, or the
+   parent `herdr` process age on Linux), even those “live work” transitions
+   are suppressed. That covers boot restore storms where agents briefly
+   look `working` then settle on `blocked`/`done` before anyone opened the
+   TUI. Override with `HERDR_NOTIFICATIONS_STARTUP_QUIET_SECS` (`0`
+   disables). Every status decision is appended to
+   `transition-debug.log` under the plugin state dir
+   (`previous→next`, whether the transition looked notify-worthy, server
+   age, quiet window, final notify) so the next reboot is diagnosable.
+4. The notification is shown on a background thread with a bounded wait, so
    a stuck notification daemon can never hang the process indefinitely.
    Summary is `{agent} is done` / `{agent} needs you`; body is
    `location · tab` plus a short `Click to open` hint. Labels come from
    `herdr pane` / `workspace` / `tab` list for the event pane, falling back
    to `HERDR_PLUGIN_CONTEXT_JSON`, then cwd basename / tab id.
-4. Actionable toasts show a single **Close** button where the platform
+5. Actionable toasts show a single **Close** button where the platform
    supports notification actions (Linux/BSD, Windows, macOS). Clicking the
    notification body runs `herdr agent focus <pane_id>` to bring that pane
    back into view. The toast stays up for 60 seconds, and the plugin process
    exits with it.
-5. Closing a notification is not a click. The one exception is
+6. Closing a notification is not a click. The one exception is
    xfce4-notifyd, where a body click emits *only*
    `NotificationClosed(Dismissed)` and never `ActionInvoked`; the plugin
    detects that daemon via `GetServerInformation` and reads a dismissal as a
