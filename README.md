@@ -15,7 +15,9 @@ terminal.
   `idle`/`unknown` does not toast — so restarting `herdr server` after a
   laptop reboot no longer floods notifications for every restored agent.
 - **Click to focus**: clicking a status-change notification focuses the
-  originating pane back in herdr.
+  originating pane back in herdr. On Linux, set
+  `HERDR_NOTIFICATIONS_RAISE_HOST=1` to also raise the terminal window that
+  hosts the Herdr UI (KDE, GNOME, XFCE/X11, Hyprland, Sway — best-effort).
 - **Location in the toast**: body shows `workspace · tab` (and the agent
   title when present) so you can tell which project fired, not only which
   agent binary.
@@ -76,8 +78,16 @@ plugin's binary is invoked once per event:
 5. Actionable toasts show a single **Close** button where the platform
    supports notification actions (Linux/BSD, Windows, macOS). Clicking the
    notification body runs `herdr agent focus <pane_id>` to bring that pane
-   back into view. The toast stays up for 60 seconds, and the plugin process
-   exits with it.
+   back into view. On Linux, opt in with `HERDR_NOTIFICATIONS_RAISE_HOST=1`
+   to also raise the host terminal window via desktop-specific APIs (KWin
+   on KDE, GNOME Shell Eval on GNOME, `hyprctl`/`swaymsg` on those
+   compositors, `wmctrl` plus `xdotool` activate/raise/focus on X11 —
+   needed when the WM focuses without raising, e.g. XFCE
+   `raise_on_focus=false`). If the plugin process has no `DISPLAY`
+   (common when `herdr server` is started by systemd), it imports
+   `DISPLAY` / desktop vars from the Herdr UI client's `/proc` environ
+   before raising. The toast stays up for 60 seconds, and the plugin
+   process exits with it.
 6. Closing a notification is not a click. The one exception is
    xfce4-notifyd, where a body click emits *only*
    `NotificationClosed(Dismissed)` and never `ActionInvoked`; the plugin
@@ -102,6 +112,9 @@ parse failure, so a future herdr status will not break the plugin.
 - A working OS notification backend: a D-Bus session + notification daemon
   on Linux/BSD (present on virtually every desktop environment), or the
   native notification center on macOS/Windows.
+- Optional (Linux host-window raise): one or more of `wmctrl`, `xdotool`,
+  `qdbus`/`qdbus6` (KDE), `gdbus` (GNOME), `hyprctl` (Hyprland), or
+  `swaymsg` (Sway), depending on your desktop.
 
 ## Development
 

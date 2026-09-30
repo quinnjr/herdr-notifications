@@ -61,6 +61,12 @@ const CLOSE_ACTION_LABEL: &str = "Close";
 /// Shown on actionable status toasts; kept short for small notification bodies.
 const CLICK_HINT: &str = "Click to open";
 
+/// Raise the OS window hosting the Herdr UI client after a notification click.
+/// Opt in with `1`; default off. Linux only — uses desktop-specific APIs where
+/// available (KDE KWin, GNOME Shell, Hyprland, Sway) and falls back to X11
+/// `wmctrl`/`xdotool`.
+const RAISE_HOST_ENV: &str = "HERDR_NOTIFICATIONS_RAISE_HOST";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Sound {
     None,
@@ -808,6 +814,10 @@ fn normalize_action_response(response: &ActionResponse<'_>) -> NotificationRespo
 /// focus in herdr when the user clicks it. Uses the `herdr` binary herdr
 /// hands every plugin process via $HERDR_BIN_PATH (falling back to `herdr`
 /// on PATH) rather than talking to the socket API directly.
+///
+/// On Linux, when [`should_raise_host_window`] is enabled, also raises the OS
+/// window that hosts the Herdr UI client (`herdr agent focus` only switches
+/// the pane inside Herdr).
 fn focus_pane(pane_id: &str) {
     let bin = herdr_bin();
     match Command::new(&bin).args(["agent", "focus", pane_id]).output() {
@@ -822,6 +832,448 @@ fn focus_pane(pane_id: &str) {
         }
         _ => {}
     }
+    if should_raise_host_window() {
+        raise_herdr_host_window();
+    }
+}
+
+fn should_raise_host_window() -> bool {
+    matches!(env::var(RAISE_HOST_ENV).as_deref(), Ok("1"))
+}
+
+/// Linux desktop hint derived from session environment variables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxDesktop {
+    Kde,
+    Gnome,
+    Xfce,
+    Generic,
+}
+
+/// GUI session vars needed to raise a host window. Plugin processes spawned by
+/// a systemd-started `herdr server` often lack these even when the Herdr UI
+/// client (under WezTerm) has them — so we import missing keys from the client
+/// `/proc/<pid>/environ` before calling `wmctrl`/`xdotool`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LinuxGuiSession {
+    display: Option<String>,
+    wayland_display: Option<String>,
+    xdg_current_desktop: Option<String>,
+    desktop_session: Option<String>,
+}
+
+impl LinuxGuiSession {
+    fn from_environ_map(map: &HashMap<String, String>) -> Self {
+        Self {
+            display: map.get("DISPLAY").cloned(),
+            wayland_display: map.get("WAYLAND_DISPLAY").cloned(),
+            xdg_current_desktop: map.get("XDG_CURRENT_DESKTOP").cloned(),
+            desktop_session: map.get("DESKTOP_SESSION").cloned(),
+        }
+    }
+
+    fn from_process_env() -> Self {
+        Self {
+            display: env::var("DISPLAY").ok(),
+            wayland_display: env::var("WAYLAND_DISPLAY").ok(),
+            xdg_current_desktop: env::var("XDG_CURRENT_DESKTOP").ok(),
+            desktop_session: env::var("DESKTOP_SESSION").ok(),
+        }
+    }
+
+    /// Copy only keys we do not already have (never override an explicit value).
+    fn fill_missing_from(&mut self, other: &Self) {
+        if self.display.is_none() {
+            self.display = other.display.clone();
+        }
+        if self.wayland_display.is_none() {
+            self.wayland_display = other.wayland_display.clone();
+        }
+        if self.xdg_current_desktop.is_none() {
+            self.xdg_current_desktop = other.xdg_current_desktop.clone();
+        }
+        if self.desktop_session.is_none() {
+            self.desktop_session = other.desktop_session.clone();
+        }
+    }
+
+    fn is_x11(&self) -> bool {
+        self.wayland_display.is_none() && self.display.is_some()
+    }
+
+    fn desktop(&self) -> LinuxDesktop {
+        linux_desktop_from_env(
+            self.xdg_current_desktop.as_deref().unwrap_or(""),
+            self.desktop_session.as_deref().unwrap_or(""),
+        )
+    }
+
+    /// Ensure child X11/Wayland tools see the session even when this process
+    /// was spawned without it (systemd `herdr server` → plugin).
+    fn apply_to(&self, cmd: &mut Command) {
+        if let Some(ref v) = self.display {
+            cmd.env("DISPLAY", v);
+        }
+        if let Some(ref v) = self.wayland_display {
+            cmd.env("WAYLAND_DISPLAY", v);
+        }
+        if let Some(ref v) = self.xdg_current_desktop {
+            cmd.env("XDG_CURRENT_DESKTOP", v);
+        }
+        if let Some(ref v) = self.desktop_session {
+            cmd.env("DESKTOP_SESSION", v);
+        }
+    }
+}
+
+/// Parse `/proc/<pid>/environ` bytes (`KEY=value\0…`) into a map.
+fn parse_proc_environ(bytes: &[u8]) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for entry in bytes.split(|b| *b == 0).filter(|s| !s.is_empty()) {
+        let Ok(s) = std::str::from_utf8(entry) else {
+            continue;
+        };
+        if let Some((key, value)) = s.split_once('=') {
+            map.insert(key.to_string(), value.to_string());
+        }
+    }
+    map
+}
+
+/// Pure helper: map `XDG_CURRENT_DESKTOP` / `DESKTOP_SESSION` strings to a
+/// coarse desktop profile for choosing a raise strategy.
+fn linux_desktop_from_env(desktop: &str, session: &str) -> LinuxDesktop {
+    let combined = format!("{desktop} {session}").to_ascii_lowercase();
+    if ["kde", "plasma"].iter().any(|token| combined.contains(token)) {
+        LinuxDesktop::Kde
+    } else if ["gnome", "ubuntu:gnome", "unity"]
+        .iter()
+        .any(|token| combined.contains(token))
+    {
+        LinuxDesktop::Gnome
+    } else if combined.contains("xfce") {
+        LinuxDesktop::Xfce
+    } else {
+        LinuxDesktop::Generic
+    }
+}
+
+/// True when `argv` looks like a long-lived Herdr UI client (`herdr`,
+/// `herdr --session …`), not `herdr server` or short CLI helpers like
+/// `herdr agent focus`.
+fn is_herdr_ui_client_argv(argv: &[String]) -> bool {
+    let Some(bin) = argv.first() else {
+        return false;
+    };
+    let Some(name) = Path::new(bin).file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    if name != "herdr" {
+        return false;
+    }
+    match argv.get(1).map(String::as_str) {
+        None => true,
+        Some(arg) if arg.starts_with('-') => true,
+        Some(_) => false,
+    }
+}
+
+/// Walk each client PID's parent chain and return the first window id a
+/// lookup finds. Pure so unit tests can inject parent/window maps.
+fn pick_host_window_id(
+    client_pids: &[u32],
+    parent_of: impl Fn(u32) -> Option<u32>,
+    window_for: impl Fn(u32) -> Option<String>,
+) -> Option<String> {
+    for &start in client_pids {
+        let mut pid = start;
+        // Cap depth so a corrupt parent loop cannot hang the plugin.
+        for _ in 0..64 {
+            if let Some(wid) = window_for(pid) {
+                return Some(wid);
+            }
+            match parent_of(pid) {
+                Some(parent) if parent > 1 && parent != pid => pid = parent,
+                _ => break,
+            }
+        }
+    }
+    None
+}
+
+/// Best-effort: activate the terminal/GUI window that owns a Herdr UI client.
+/// No-op when not on Linux or when no host window can be found.
+fn raise_herdr_host_window() {
+    #[cfg(target_os = "linux")]
+    {
+        let clients = linux_herdr_ui_client_pids();
+        if clients.is_empty() {
+            eprintln!(
+                "herdr-notifications: focused pane but found no Herdr UI client to raise"
+            );
+            return;
+        }
+        // systemd-started `herdr server` often has no DISPLAY; import from the
+        // UI client process so wmctrl/xdotool can talk to the session.
+        let mut gui = LinuxGuiSession::from_process_env();
+        for &pid in &clients {
+            if let Ok(bytes) = fs::read(format!("/proc/{pid}/environ")) {
+                gui.fill_missing_from(&LinuxGuiSession::from_environ_map(&parse_proc_environ(
+                    &bytes,
+                )));
+            }
+        }
+        for &pid in &clients {
+            if linux_raise_client_pid(pid, &gui) {
+                return;
+            }
+        }
+        eprintln!(
+            "herdr-notifications: focused pane but could not find a host window to raise"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_raise_client_pid(pid: u32, gui: &LinuxGuiSession) -> bool {
+    let desktop = gui.desktop();
+    match desktop {
+        LinuxDesktop::Kde if linux_kde_activate_pid(pid, gui) => return true,
+        LinuxDesktop::Gnome if linux_gnome_activate_pid(pid, gui) => return true,
+        _ => {}
+    }
+    if linux_hyprland_focus_pid(pid, gui) {
+        return true;
+    }
+    if linux_sway_focus_pid(pid, gui) {
+        return true;
+    }
+    if gui.is_x11() {
+        if let Some(wid) = pick_host_window_id(&[pid], linux_parent_pid, |p| {
+            linux_x11_window_id_for_pid(p, gui)
+        }) {
+            if linux_x11_activate_window(&wid, gui).is_ok() {
+                return true;
+            }
+        }
+    }
+    // Ambiguous Wayland session: try compositor APIs even when the desktop
+    // string didn't match (e.g. custom session names).
+    if !gui.is_x11() {
+        if linux_kde_activate_pid(pid, gui) {
+            return true;
+        }
+        if linux_gnome_activate_pid(pid, gui) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn linux_herdr_ui_client_pids() -> Vec<u32> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut pids = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid_str) = name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        let cmdline_path = entry.path().join("cmdline");
+        let Ok(bytes) = fs::read(&cmdline_path) else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        let argv: Vec<String> = bytes
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        if is_herdr_ui_client_argv(&argv) {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+#[cfg(target_os = "linux")]
+fn linux_parent_pid(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `/proc/pid/stat`: pid (comm) state ppid ... — comm may contain spaces/parens,
+    // so take the field after the last ')' then skip state.
+    let after_comm = stat.rsplit_once(')')?.1;
+    after_comm.split_whitespace().nth(1)?.parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_x11_window_id_for_pid(pid: u32, gui: &LinuxGuiSession) -> Option<String> {
+    let mut cmd = Command::new("xdotool");
+    cmd.args(["search", "--pid", &pid.to_string()]);
+    gui.apply_to(&mut cmd);
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let wid = stdout.lines().next()?.trim();
+    if wid.is_empty() {
+        None
+    } else {
+        Some(wid.to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_kde_activate_pid(pid: u32, gui: &LinuxGuiSession) -> bool {
+    for qdbus in ["qdbus6", "qdbus"] {
+        let mut wid_cmd = Command::new(qdbus);
+        wid_cmd.args([
+            "org.kde.KWin",
+            "/KWin",
+            "org.kde.KWin.windowByPid",
+            &pid.to_string(),
+        ]);
+        gui.apply_to(&mut wid_cmd);
+        let Ok(wid_out) = wid_cmd.output() else {
+            continue;
+        };
+        if !wid_out.status.success() {
+            continue;
+        }
+        let wid = String::from_utf8_lossy(&wid_out.stdout).trim().to_string();
+        if wid.is_empty() {
+            continue;
+        }
+        for method in ["org.kde.KWin.activateWindow", "org.kde.KWin.forceActiveWindow"] {
+            let mut act_cmd = Command::new(qdbus);
+            act_cmd.args(["org.kde.KWin", "/KWin", method, &wid]);
+            gui.apply_to(&mut act_cmd);
+            if let Ok(act) = act_cmd.output()
+                && act.status.success()
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn linux_gnome_activate_pid(pid: u32, gui: &LinuxGuiSession) -> bool {
+    let script = format!(
+        "global.get_window_tracker().list_all_windows().forEach(function(w) {{ if (w.get_pid() === {pid}) w.activate(global.get_current_time()); }});"
+    );
+    let mut cmd = Command::new("gdbus");
+    cmd.args([
+        "call",
+        "--session",
+        "--dest",
+        "org.gnome.Shell",
+        "--object-path",
+        "/org/gnome/Shell",
+        "--method",
+        "org.gnome.Shell.Eval",
+        "s",
+        &script,
+    ]);
+    gui.apply_to(&mut cmd);
+    let Ok(output) = cmd.output() else {
+        return false;
+    };
+    output.status.success()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_hyprland_focus_pid(pid: u32, gui: &LinuxGuiSession) -> bool {
+    if env::var("HYPRLAND_INSTANCE_SIGNATURE").is_err() {
+        return false;
+    }
+    let mut cmd = Command::new("hyprctl");
+    cmd.args(["dispatch", "focuswindow", &format!("pid:{pid}")]);
+    gui.apply_to(&mut cmd);
+    cmd.output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_sway_focus_pid(pid: u32, gui: &LinuxGuiSession) -> bool {
+    if env::var("SWAYSOCK").is_err() {
+        return false;
+    }
+    let mut cmd = Command::new("swaymsg");
+    cmd.args([&format!("[con_pid={pid}]"), "focus"]);
+    gui.apply_to(&mut cmd);
+    cmd.output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_x11_activate_window(wid: &str, gui: &LinuxGuiSession) -> Result<(), String> {
+    // Prefer wmctrl (handles desktop switch + raise well on XFCE and many WMs).
+    // Also run xdotool activate/raise/focus: some WMs (notably XFCE with
+    // raise_on_focus=false) can focus without bringing the window forward.
+    let hex = if let Some(stripped) = wid.strip_prefix("0x").or_else(|| wid.strip_prefix("0X")) {
+        format!("0x{stripped}")
+    } else if let Ok(n) = wid.parse::<u64>() {
+        format!("0x{n:x}")
+    } else {
+        wid.to_string()
+    };
+
+    let mut errors = Vec::new();
+    let mut wm = Command::new("wmctrl");
+    wm.args(["-ia", &hex]);
+    gui.apply_to(&mut wm);
+    match wm.output() {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => errors.push(format!(
+            "wmctrl: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(e) => errors.push(format!("wmctrl: {e}")),
+    }
+
+    let mut xd_cmd = Command::new("xdotool");
+    xd_cmd.args([
+        "windowactivate",
+        "--sync",
+        wid,
+        "windowraise",
+        wid,
+        "windowfocus",
+        "--sync",
+        wid,
+    ]);
+    gui.apply_to(&mut xd_cmd);
+    let xd = xd_cmd.output();
+    match xd {
+        Ok(out) if out.status.success() => return Ok(()),
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            // wmctrl alone is enough when xdotool fails after a successful raise.
+            if errors.is_empty() {
+                return Ok(());
+            }
+            errors.push(format!("xdotool: {err}"));
+        }
+        Err(e) => {
+            if errors.is_empty() {
+                return Ok(());
+            }
+            errors.push(format!("xdotool: {e}"));
+        }
+    }
+
+    Err(errors.join("; "))
 }
 
 /// Suppress toasts for this many seconds after `herdr server` starts.
@@ -1711,6 +2163,139 @@ mod tests {
                 "{reason:?} is not a click"
             );
         }
+    }
+
+    #[test]
+    fn should_raise_host_window_matches_env_flag() {
+        assert_eq!(
+            should_raise_host_window(),
+            matches!(env::var(RAISE_HOST_ENV).as_deref(), Ok("1"))
+        );
+    }
+
+    #[test]
+    fn linux_desktop_from_env_detects_common_sessions() {
+        assert_eq!(
+            linux_desktop_from_env("KDE", "plasma"),
+            LinuxDesktop::Kde
+        );
+        assert_eq!(
+            linux_desktop_from_env("GNOME", "ubuntu"),
+            LinuxDesktop::Gnome
+        );
+        assert_eq!(
+            linux_desktop_from_env("XFCE", "xfce"),
+            LinuxDesktop::Xfce
+        );
+        assert_eq!(
+            linux_desktop_from_env("i3", "i3"),
+            LinuxDesktop::Generic
+        );
+    }
+
+    #[test]
+    fn is_herdr_ui_client_argv_accepts_bare_and_flag_launches() {
+        assert!(is_herdr_ui_client_argv(&["herdr".into()]));
+        assert!(is_herdr_ui_client_argv(&["/home/u/.local/bin/herdr".into()]));
+        assert!(is_herdr_ui_client_argv(&[
+            "herdr".into(),
+            "--session".into(),
+            "main".into()
+        ]));
+    }
+
+    #[test]
+    fn is_herdr_ui_client_argv_rejects_server_and_cli_subcommands() {
+        assert!(!is_herdr_ui_client_argv(&["herdr".into(), "server".into()]));
+        assert!(!is_herdr_ui_client_argv(&[
+            "/home/u/.local/bin/herdr".into(),
+            "server".into()
+        ]));
+        assert!(!is_herdr_ui_client_argv(&[
+            "herdr".into(),
+            "agent".into(),
+            "focus".into(),
+            "w1:p1".into()
+        ]));
+        assert!(!is_herdr_ui_client_argv(&["bash".into()]));
+        assert!(!is_herdr_ui_client_argv(&[]));
+    }
+
+    #[test]
+    fn pick_host_window_id_walks_client_ancestors_to_wezterm() {
+        // client 100 → bash 50 → wezterm 10 (has window); unrelated 200 → 99 (no window)
+        let parent = |pid: u32| match pid {
+            100 => Some(50),
+            50 => Some(10),
+            10 => Some(1),
+            200 => Some(99),
+            99 => Some(1),
+            _ => None,
+        };
+        let window_for = |pid: u32| match pid {
+            10 => Some("0xabc".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            pick_host_window_id(&[100, 200], parent, window_for).as_deref(),
+            Some("0xabc")
+        );
+        assert_eq!(pick_host_window_id(&[200], parent, window_for), None);
+    }
+
+    #[test]
+    fn parse_proc_environ_splits_nul_terminated_key_values() {
+        let bytes = b"DISPLAY=:0.0\0XDG_CURRENT_DESKTOP=XFCE\0HOME=/home/u\0\0";
+        let map = parse_proc_environ(bytes);
+        assert_eq!(map.get("DISPLAY").map(String::as_str), Some(":0.0"));
+        assert_eq!(
+            map.get("XDG_CURRENT_DESKTOP").map(String::as_str),
+            Some("XFCE")
+        );
+        assert_eq!(map.get("HOME").map(String::as_str), Some("/home/u"));
+    }
+
+    #[test]
+    fn linux_gui_session_from_environ_map_reads_display_keys() {
+        let mut map = HashMap::new();
+        map.insert("DISPLAY".into(), ":0.0".into());
+        map.insert("XDG_CURRENT_DESKTOP".into(), "XFCE".into());
+        map.insert("DESKTOP_SESSION".into(), "xfce".into());
+        map.insert("IGNORED".into(), "x".into());
+        let session = LinuxGuiSession::from_environ_map(&map);
+        assert_eq!(session.display.as_deref(), Some(":0.0"));
+        assert_eq!(session.wayland_display, None);
+        assert_eq!(session.xdg_current_desktop.as_deref(), Some("XFCE"));
+        assert_eq!(session.desktop_session.as_deref(), Some("xfce"));
+        assert!(session.is_x11());
+        assert_eq!(session.desktop(), LinuxDesktop::Xfce);
+    }
+
+    #[test]
+    fn linux_gui_session_fill_missing_keeps_existing_and_imports_rest() {
+        // Plugin spawned by systemd-user herdr server: no DISPLAY. UI client has it.
+        let mut session = LinuxGuiSession::default();
+        let client = LinuxGuiSession {
+            display: Some(":0.0".into()),
+            wayland_display: None,
+            xdg_current_desktop: Some("XFCE".into()),
+            desktop_session: Some("xfce".into()),
+        };
+        session.fill_missing_from(&client);
+        assert_eq!(session.display.as_deref(), Some(":0.0"));
+        assert_eq!(session.xdg_current_desktop.as_deref(), Some("XFCE"));
+
+        let mut already = LinuxGuiSession {
+            display: Some(":1".into()),
+            ..LinuxGuiSession::default()
+        };
+        already.fill_missing_from(&client);
+        assert_eq!(
+            already.display.as_deref(),
+            Some(":1"),
+            "must not override an already-set DISPLAY"
+        );
+        assert_eq!(already.xdg_current_desktop.as_deref(), Some("XFCE"));
     }
 
     #[test]
